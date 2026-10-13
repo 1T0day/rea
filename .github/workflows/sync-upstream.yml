@@ -1,0 +1,41 @@
+name: Sync upstream
+
+on:
+  # 每 5 分钟检查一次，避开整点
+  schedule:
+    - cron: '2-57/5 * * * *'
+
+  # 支持在 Actions 页面手动运行
+  workflow_dispatch:
+
+# 允许同步代码
+permissions:
+  contents: write
+
+# 同一时间只运行一个同步任务
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync main from upstream
+    if: github.repository == '1T0day/rea' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Merge upstream updates
+        env:
+          # 默认使用 GitHub 自动提供的令牌
+          # 如配置了 SYNC_TOKEN，则优先使用它
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${REPOSITORY}/merge-upstream" \
+            -f branch=main
