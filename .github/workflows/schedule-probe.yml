@@ -1,0 +1,22 @@
+name: Schedule probe
+
+on:
+  schedule:
+    - cron: '2-57/5 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Record trigger details
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'event=%s\nref=%s\nsha=%s\nactor=%s\n' \
+            "$GITHUB_EVENT_NAME" "$GITHUB_REF" "$GITHUB_SHA" "$GITHUB_ACTOR" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          date -u '+UTC=%Y-%m-%dT%H:%M:%SZ' | tee -a "$GITHUB_STEP_SUMMARY"
