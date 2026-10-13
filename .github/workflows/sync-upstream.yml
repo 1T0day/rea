@@ -1,18 +1,14 @@
 name: Sync upstream
 
 on:
-  # 每 5 分钟检查一次，避开整点
+  # 每小时第 17 分钟运行；GitHub 调度可能延迟。
   schedule:
-    - cron: '2-57/5 * * * *'
-
-  # 支持在 Actions 页面手动运行
+    - cron: '17 * * * *'
   workflow_dispatch:
 
-# 允许同步代码
 permissions:
   contents: write
 
-# 同一时间只运行一个同步任务
 concurrency:
   group: sync-upstream-main
   cancel-in-progress: false
@@ -25,17 +21,79 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Merge upstream updates
+      - name: Record trigger details
         env:
-          # 默认使用 GitHub 自动提供的令牌
-          # 如配置了 SYNC_TOKEN，则优先使用它
+          CRON_EXPRESSION: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+          {
+            echo '## 同步运行记录'
+            printf -- '- 触发方式：`%s`\n' "$GITHUB_EVENT_NAME"
+            printf -- '- Cron：`%s`\n' "${CRON_EXPRESSION:-手动触发}"
+            printf -- '- 分支：`%s`\n' "$GITHUB_REF"
+            printf -- '- 工作流提交：`%s`\n' "$GITHUB_SHA"
+            printf -- '- 执行账号：`%s`\n' "$GITHUB_ACTOR"
+            printf -- '- 运行编号：`%s`，尝试次数：`%s`\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            date -u '+- 开始时间（UTC）：%Y-%m-%d %H:%M:%S'
+            TZ=Asia/Shanghai date '+- 开始时间（北京时间）：%Y-%m-%d %H:%M:%S'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Merge upstream updates
+        id: merge
+        env:
+          # 使用已有 Secret；不输出令牌值或认证请求头。
           GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
-          gh api \
+          record_head() {
+            local phase="$1"
+            local sha
+            if sha=$(gh api "repos/${REPOSITORY}/branches/main" --jq '.commit.sha'); then
+              printf -- '- %s main SHA：`%s`\n' "$phase" "$sha" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::无法读取${phase}的分支状态；详情见步骤日志。"
+              printf -- '- %s main SHA：读取失败，状态未知\n' "$phase" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
+          record_head '同步前'
+          response_file="$RUNNER_TEMP/sync-upstream-response.json"
+          if gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
             "repos/${REPOSITORY}/merge-upstream" \
-            -f branch=main
+            -f branch=main > "$response_file"; then
+            sync_exit=0
+          else
+            sync_exit=$?
+          fi
+
+          {
+            echo
+            echo '### GitHub 同步接口返回'
+            echo '```json'
+            cat "$response_file"
+            printf '\n```\n'
+            printf -- '- API 命令退出码：`%s`\n' "$sync_exit"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          record_head '同步后'
+
+          if [ "$sync_exit" -ne 0 ]; then
+            echo '::error::同步接口调用失败；请查看接口返回和步骤日志。'
+          fi
+          exit "$sync_exit"
+
+      - name: Record final result
+        if: always()
+        env:
+          MERGE_OUTCOME: ${{ steps.merge.outcome }}
+        run: |
+          set -euo pipefail
+          {
+            echo
+            printf -- '- 同步步骤结果：`%s`\n' "$MERGE_OUTCOME"
+            date -u '+- 结束时间（UTC）：%Y-%m-%d %H:%M:%S'
+            TZ=Asia/Shanghai date '+- 结束时间（北京时间）：%Y-%m-%d %H:%M:%S'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
