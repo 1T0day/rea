@@ -10,13 +10,14 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 
-import { expect, it as test } from "vitest";
+import { expect, it as test, vi } from "vitest";
 
 import type { BinaryTarget } from "../../../../src/domain/binaryTargetTypes.js";
 import type { JsonValue } from "../../../../src/domain/jsonValue.js";
 import type { KunaProcessLauncher } from "../../../../src/kuna/KunaCommand.js";
 import { KunaProvider } from "../../../../src/kuna/KunaProvider.js";
 import { KUNA_FUNCTION_TEXT_BYTES } from "../../../../src/kuna/KunaLimits.js";
+import { KunaProjectCache } from "../../../../src/kuna/KunaProjectCache.js";
 import { cleanupOwnedProcessGroup } from "../../../../src/process/ProcessOwnership.js";
 import { spawnOwnedProviderProcess } from "../../../../src/process/ProviderProcess.js";
 import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js";
@@ -26,7 +27,13 @@ import {
   writeFakeKuna,
 } from "./fakeKuna.js";
 
-import { session, run, exportsOf, FUNCTIONS } from "./kunaSessionFixture.js";
+import {
+  session,
+  run,
+  exportsOf,
+  FUNCTIONS,
+  unprovenCleanupLauncher,
+} from "./kunaSessionFixture.js";
 
 const it = test.skipIf(process.platform === "win32");
 
@@ -186,6 +193,36 @@ it("answers a cold request from one function, then serves the finished export", 
   await again.close();
 });
 
+it("verifies a warm export once for concurrent first requests on a fresh server", async () => {
+  const { kuna, target, cacheRoot, profile, open } = await session(
+    "rea-kuna-warm-concurrent-",
+  );
+  const builder = open();
+  await run(builder, "procedure_assembly", { procedure: "main" });
+  expect(await builder.close()).toEqual({ ok: true, value: null });
+
+  const lookup = vi.spyOn(KunaProjectCache.prototype, "lookup");
+  const fresh = new KunaProvider(
+    { REA_KUNA_COMMAND: kuna, REA_KUNA_CACHE_DIR: cacheRoot },
+    { platform: process.platform },
+  ).createClient(target, profile);
+  try {
+    const answers = await Promise.all(
+      ["main", "parse", "0x1000", "main"].map((procedure) =>
+        run(fresh, "procedure_pseudo_code", { procedure }),
+      ),
+    );
+    for (const answer of answers)
+      expect(answer.rawResult).toMatchObject({
+        source: { kind: "project-export" },
+      });
+    expect(lookup).toHaveBeenCalledTimes(1);
+  } finally {
+    lookup.mockRestore();
+    expect(await fresh.close()).toEqual({ ok: true, value: null });
+  }
+});
+
 it("lists, searches and resolves procedures from Kuna's inventory", async () => {
   const { open } = await session("rea-kuna-inventory-");
   const client = open();
@@ -278,7 +315,7 @@ it("reports a failed function and an import slot as unavailable text, not errors
   await client.close();
 });
 
-it("builds a dossier with pseudocode and assembly, and the rest explicitly unavailable", async () => {
+it("builds a dossier with text and call relationships, leaving unsupported facets unavailable", async () => {
   const { open } = await session("rea-kuna-dossier-");
   const client = open();
 
@@ -334,8 +371,8 @@ it("builds a dossier with pseudocode and assembly, and the rest explicitly unava
     facet_availability: {
       pseudocode: { available: true },
       assembly: { available: true },
-      callers: { available: false },
-      callees: { available: false },
+      callers: { available: true },
+      callees: { available: true },
       references: { available: false },
       cfg: { available: false },
     },
@@ -493,7 +530,9 @@ it("refuses another document, an unsupported operation and a replaced executable
       document: "/other/program",
     }),
   ).toMatchObject({ ok: false, error: { _tag: "AnalysisInputError" } });
-  expect(await client.execute("xrefs", { address: "0x1000" })).toMatchObject({
+  expect(
+    await client.execute("search_strings", { pattern: "unused" }),
+  ).toMatchObject({
     ok: false,
     error: { _tag: "AnalysisCapabilityUnavailableError" },
   });
@@ -515,28 +554,6 @@ it("refuses another document, an unsupported operation and a replaced executable
   });
   await replaced.close();
 });
-
-/**
- * Launch for real, but have cleanup of the selected subcommand report an
- * unproven stop until `release` is called, as a lost ownership proof would.
- */
-const unprovenCleanupLauncher = (subcommand: string) => {
-  let proven = false;
-  const launcher: KunaProcessLauncher = async (options) => {
-    const spawned = await spawnOwnedProviderProcess(options);
-    if (options.arguments[0] !== subcommand) return spawned;
-    return {
-      ...spawned,
-      cleanup: async () => {
-        const cleaned = await cleanupOwnedProcessGroup(spawned.ownership);
-        return proven
-          ? cleaned
-          : { cleaned: false, reason: `${subcommand} stop unproven` };
-      },
-    };
-  };
-  return { launcher, release: () => (proven = true) };
-};
 
 it("retains an active request's workspace when close cannot prove its stop", async () => {
   const unproven = unprovenCleanupLauncher("decompile");
